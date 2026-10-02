@@ -2,9 +2,11 @@
 // - polls $UBC_DIR/inbox/<session id>/*.msg (default ~/.ubc), which the `ubc` CLI drops
 // - claims each message by moving it to $UBC_DIR/read/<session id>/, then
 //   submits them all as one prompt, so a message starts a turn (queued behind a running one)
-// - keeps $UBC_DIR/sessions/<session id>.json fresh so `ubc --list` shows live sessions
+// - keeps $UBC_DIR/sessions/<session id>.json fresh (cwd, herdr ids, name) so the CLI
+//   can find this session from a shell that never saw its id
 // - /ubc prints this session's id, the send command and how many messages wait
 //   (delivery stays with the timer: a command hook cannot submit a prompt)
+// - /ubc name <name> names this session for `ubc --to <name>`; /ubc name - drops it
 
 import type { EngineInterface, Register } from 'claude-code'
 
@@ -42,10 +44,22 @@ function format(list: Message[]): string {
   return list.map(m => `ubc message${m.from ? ` from ${m.from}` : ''}:\n${m.text}`).join('\n\n')
 }
 
+async function nameOf($: EngineInterface, sid: string): Promise<string | null> {
+  const got = await $.store.get(`name:${sid}`)
+  return typeof got === 'string' ? got : null
+}
+
 async function beat($: EngineInterface): Promise<void> {
   const p = await paths($)
   const at = new Date(await $.clock.now()).toISOString()
-  await $.fs.write(p.beat, JSON.stringify({ sid: p.sid, cwd: await $.session.cwd(), at }) + '\n')
+  const herdr = {
+    workspace: (await $.env.get('HERDR_WORKSPACE_ID')) ?? null,
+    tab: (await $.env.get('HERDR_TAB_ID')) ?? null,
+    pane: (await $.env.get('HERDR_PANE_ID')) ?? null,
+  }
+  const cwd = await $.session.cwd()
+  const entry = { sid: p.sid, name: await nameOf($, p.sid), cwd, herdr, at }
+  await $.fs.write(p.beat, JSON.stringify(entry) + '\n')
 }
 
 async function waiting($: EngineInterface, inbox: string): Promise<string[]> {
@@ -81,7 +95,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'ubc',
-      description: "Show this session's ubc id and how to message it",
+      description: "Show this session's ubc id; /ubc name <name> to name it",
     })
     $.clock.every(POLL_MS, () => poll($))
     $.clock.every(BEAT_MS, () => beat($))
@@ -91,13 +105,23 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'ubc' }, async $ => {
+  on('command.run', { command: 'ubc' }, async ($, e) => {
     const p = await paths($)
+    const [verb, arg] = e.args.trim().split(/\s+/)
+    if (verb === 'name') {
+      if (arg === undefined || arg === '') return { text: `ubc: name is ${(await nameOf($, p.sid)) ?? 'unset'}` }
+      if (arg === '-') await $.store.delete(`name:${p.sid}`)
+      else if (/^[A-Za-z0-9_.-]+$/.test(arg)) await $.store.set(`name:${p.sid}`, arg)
+      else return { text: `ubc: bad name ${arg}: use letters, digits, _ . -` }
+      await beat($)
+      return { text: arg === '-' ? 'ubc: name dropped' : `ubc: named ${arg}\nsend: ubc --to ${arg} "msg"` }
+    }
     await beat($)
     const n = (await waiting($, p.inbox)).length
+    const named = await nameOf($, p.sid)
     return {
       text:
-        `ubc: this session is ${p.sid}\n` +
+        `ubc: this session is ${p.sid}${named ? ` (${named})` : ''}\n` +
         `send: ubc --agent ${p.sid} "hi there from ubc"\n` +
         `inbox: ${p.inbox}` +
         (n > 0 ? `\n${n} message${n === 1 ? '' : 's'} waiting, delivered within ${POLL_MS / 1000}s` : ''),

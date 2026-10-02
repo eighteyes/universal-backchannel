@@ -1,38 +1,106 @@
 #!/usr/bin/env bash
 # ubc: universal backchannel, the sender end.
 # - `ubc --agent <uuid> "msg"` drops a message in that session's inbox; the ubc mod there starts a turn with it
-# - message from stdin when no text is given: `echo hi | ubc --agent <uuid>`
+# - with no --agent, finds the session: --to <name>, else $CLAUDE_CODE_SESSION_ID,
+#   else the live session in this herdr tab/workspace, else the one whose cwd nests with $PWD
+# - more than one match narrows by cwd, then refuses (exit 3) and lists them; it never guesses
+# - message from stdin when no text is given: `echo hi | ubc`
 # - `--from NAME` signs the message (default: $UBC_FROM, else the current dir's name)
-# - `ubc --list` shows sessions the mod has seen, newest first
+# - `ubc --who` prints the session it would send to; `ubc --list` shows live sessions
 # - writes to a dotfile then renames it, so the mod never reads half a message
 
 set -euo pipefail
 
 root="${UBC_DIR:-$HOME/.ubc}"
+live_secs="${UBC_LIVE_SECS:-150}"
 agent=""
+to=""
+who=0
 from="${UBC_FROM:-$(basename "$PWD")}"
 text=""
 
 usage() {
   cat <<EOF
-usage: ubc --agent <uuid> [--from NAME] [message]
-       ubc --list
+usage: ubc [--agent <uuid> | --to <name>] [--from NAME] [message]
+       ubc --who [--to <name>]     # which session a send would reach
+       ubc --list                  # live sessions
 EOF
 }
 
-list() {
+# Every live session's beat as one JSON object per line.
+live() {
   local dir="$root/sessions"
-  [[ -d "$dir" ]] || { echo "no sessions yet ($dir)"; return 0; }
-  ls -t "$dir" | while read -r f; do
-    [[ "$f" == *.json ]] || continue
-    printf '%s\t%s\n' "${f%.json}" "$(cat "$dir/$f")"
-  done
+  [[ -d "$dir" ]] || return 0
+  local files=("$dir"/*.json)
+  [[ -e "${files[0]}" ]] || return 0
+  jq -c --argjson secs "$live_secs" \
+    'select((now - (.at | sub("\\.[0-9]+Z$"; "Z") | fromdate)) < $secs)' "${files[@]}"
+}
+
+list() {
+  live | jq -r '[.sid, (.name // "-"), (.herdr.tab // "-"), .cwd, .at] | @tsv'
+}
+
+# Beats on stdin -> those whose cwd is this dir, above it or below it, by its
+# logical or physical path (macOS /tmp is /private/tmp).
+nests() {
+  jq -c --arg a "$PWD" --arg b "$(pwd -P)" \
+    '. as $s | select([$a, $b] | any(. as $p |
+      $s.cwd == $p or ($p | startswith($s.cwd + "/")) or ($s.cwd | startswith($p + "/"))))'
+}
+
+# Beats on stdin -> one sid on stdout and exit 0, or exit 1 for none, 3 for too many.
+pick() {
+  local got n exact
+  got="$(cat)"
+  n=$(grep -c . <<<"$got" || true)
+  if [[ $n -gt 1 ]]; then
+    got="$(nests <<<"$got")"
+    n=$(grep -c . <<<"$got" || true)
+    exact="$(jq -c --arg a "$PWD" --arg b "$(pwd -P)" 'select(.cwd == $a or .cwd == $b)' <<<"$got")"
+    [[ $(grep -c . <<<"$exact" || true) -eq 1 ]] && { got="$exact"; n=1; }
+  fi
+  case $n in
+    0) return 1 ;;
+    1) jq -r .sid <<<"$got" ;;
+    *)
+      echo "ubc: $n sessions match; pick one with --agent or --to:" >&2
+      jq -r '[.sid, (.name // "-"), .cwd] | @tsv' <<<"$got" >&2
+      return 3 ;;
+  esac
+}
+
+resolve() {
+  local all rc
+  all="$(live)"
+  if [[ -n "$to" ]]; then
+    jq -c --arg n "$to" 'select(.name == $n)' <<<"$all" | pick && return 0 || rc=$?
+    [[ $rc -eq 1 ]] && echo "ubc: no live session named $to" >&2
+    return "$rc"
+  fi
+  if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+    echo "$CLAUDE_CODE_SESSION_ID"
+    return 0
+  fi
+  if [[ -n "${HERDR_TAB_ID:-}" ]]; then
+    jq -c --arg t "$HERDR_TAB_ID" 'select(.herdr.tab == $t)' <<<"$all" | pick && return 0 || rc=$?
+    [[ $rc -eq 3 ]] && return 3
+  fi
+  if [[ -n "${HERDR_WORKSPACE_ID:-}" ]]; then
+    jq -c --arg w "$HERDR_WORKSPACE_ID" 'select(.herdr.workspace == $w)' <<<"$all" | pick && return 0 || rc=$?
+    [[ $rc -eq 3 ]] && return 3
+  fi
+  nests <<<"$all" | pick && return 0 || rc=$?
+  [[ $rc -eq 1 ]] && echo "ubc: no live session for this shell; use --agent or --to (ubc --list)" >&2
+  return "$rc"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --agent|-a) agent="${2:?--agent needs a uuid}"; shift 2 ;;
+    --to|-t) to="${2:?--to needs a name}"; shift 2 ;;
     --from|-f) from="${2:?--from needs a name}"; shift 2 ;;
+    --who|-w) who=1; shift ;;
     --list|-l) list; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; text="$*"; break ;;
@@ -41,8 +109,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$agent" ]] || { usage >&2; exit 2; }
+command -v jq >/dev/null || [[ -n "$agent" ]] || { echo "ubc: finding a session needs jq; pass --agent" >&2; exit 2; }
+if [[ -z "$agent" ]]; then
+  agent="$(resolve)" || exit $?
+fi
 [[ "$agent" =~ ^[A-Za-z0-9-]+$ ]] || { echo "ubc: bad agent id: $agent" >&2; exit 2; }
+[[ $who -eq 1 ]] && { echo "$agent"; exit 0; }
+
 [[ -n "$text" ]] || text="$(cat)"
 [[ -n "$text" ]] || { echo "ubc: empty message" >&2; exit 2; }
 
