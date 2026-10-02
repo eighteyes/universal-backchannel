@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# ubc: universal backchannel, the sender end.
+# - `ubc --agent <uuid> "msg"` drops a message in that session's inbox; the ubc mod there starts a turn with it
+# - message from stdin when no text is given: `echo hi | ubc --agent <uuid>`
+# - `--from NAME` signs the message (default: $UBC_FROM, else the current dir's name)
+# - `ubc --list` shows sessions the mod has seen, newest first
+# - writes to a dotfile then renames it, so the mod never reads half a message
+
+set -euo pipefail
+
+root="${UBC_DIR:-$HOME/.ubc}"
+agent=""
+from="${UBC_FROM:-$(basename "$PWD")}"
+text=""
+
+usage() {
+  cat <<EOF
+usage: ubc --agent <uuid> [--from NAME] [message]
+       ubc --list
+EOF
+}
+
+list() {
+  local dir="$root/sessions"
+  [[ -d "$dir" ]] || { echo "no sessions yet ($dir)"; return 0; }
+  ls -t "$dir" | while read -r f; do
+    [[ "$f" == *.json ]] || continue
+    printf '%s\t%s\n' "${f%.json}" "$(cat "$dir/$f")"
+  done
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent|-a) agent="${2:?--agent needs a uuid}"; shift 2 ;;
+    --from|-f) from="${2:?--from needs a name}"; shift 2 ;;
+    --list|-l) list; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; text="$*"; break ;;
+    -*) echo "ubc: unknown flag $1" >&2; usage >&2; exit 2 ;;
+    *) text="${text:+$text }$1"; shift ;;
+  esac
+done
+
+[[ -n "$agent" ]] || { usage >&2; exit 2; }
+[[ "$agent" =~ ^[A-Za-z0-9-]+$ ]] || { echo "ubc: bad agent id: $agent" >&2; exit 2; }
+[[ -n "$text" ]] || text="$(cat)"
+[[ -n "$text" ]] || { echo "ubc: empty message" >&2; exit 2; }
+
+inbox="$root/inbox/$agent"
+mkdir -p "$inbox"
+name="$(date +%s)-$$-$RANDOM.msg"
+printf 'from: %s\n\n%s\n' "$from" "$text" > "$inbox/.$name"
+mv "$inbox/.$name" "$inbox/$name"
+
+if [[ ! -f "$root/sessions/$agent.json" ]]; then
+  echo "ubc: queued for $agent (no live session seen with that id yet)" >&2
+fi

@@ -1,0 +1,5 @@
+{
+  "name": "ubc",
+  "version": "0.1.0",
+  "description": "Universal backchannel: `ubc --agent <uuid> \"msg\"` starts a turn in that session"
+}
